@@ -16,7 +16,8 @@ ARCHS = amd64 arm64
 COMMONENVVAR=GOOS=$(shell uname -s | tr A-Z a-z)
 BUILDENVVAR=CGO_ENABLED=0
 
-LOCAL_REGISTRY=localhost:5000/scheduler-plugins
+#LOCAL_REGISTRY=localhost:5000/scheduler-plugins
+LOCAL_REGISTRY=fangangan
 LOCAL_IMAGE=kube-scheduler:latest
 LOCAL_CONTROLLER_IMAGE=controller:latest
 
@@ -74,7 +75,7 @@ build-scheduler.arm64v8:
 .PHONY: local-image
 local-image: clean
 	docker build -f ./build/scheduler/Dockerfile --build-arg ARCH="amd64" --build-arg RELEASE_VERSION="$(RELEASE_VERSION)" -t $(LOCAL_REGISTRY)/$(LOCAL_IMAGE) .
-	docker build -f ./build/controller/Dockerfile --build-arg ARCH="amd64" -t $(LOCAL_REGISTRY)/$(LOCAL_CONTROLLER_IMAGE) .
+	#docker build -f ./build/controller/Dockerfile --build-arg ARCH="amd64" -t $(LOCAL_REGISTRY)/$(LOCAL_CONTROLLER_IMAGE) .
 
 .PHONY: release-image.amd64
 release-image.amd64: clean
