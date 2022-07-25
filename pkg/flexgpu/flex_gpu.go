@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
@@ -25,6 +26,7 @@ type FlexGPU struct {
 var _ framework.FilterPlugin = &FlexGPU{}
 var _ framework.ScorePlugin = &FlexGPU{}
 var _ framework.BindPlugin = &FlexGPU{}
+var _ framework.ReservePlugin = &FlexGPU{}
 
 func (f FlexGPU) Name() string {
 	return Name
@@ -46,8 +48,8 @@ func (f FlexGPU) Filter(ctx context.Context, state *framework.CycleState, pod *v
 		}
 	}
 
-	gpuLimit, gpuLimitExist := podResourceLimitSum(GPUResourceName, pod)
-	memLimit, memLimitExist := podResourceLimitSum(MemResourceName, pod)
+	gpuLimit, gpuLimitExist := podResourceLimit(GPUResourceName, pod)
+	memLimit, memLimitExist := podResourceLimit(MemResourceName, pod)
 	if !gpuLimitExist && !memLimitExist {
 		return nil
 	}
@@ -63,24 +65,12 @@ func (f FlexGPU) Filter(ctx context.Context, state *framework.CycleState, pod *v
 		klog.V(6).InfoS("unknown", "resource", GPUResourceName)
 		return framework.NewStatus(framework.UnschedulableAndUnresolvable, "unknown resource type")
 	}
-	gpuCnt, ok := gpuAllocatable.AsInt64()
-	if !ok {
-		panic("invalid gpu resource format")
-	}
 
 	memAllocatable, ok := nodeInfo.Node().Status.Allocatable[MemResourceName]
-	memCnt, ok := memAllocatable.AsInt64()
-	if !ok {
-		panic("invalid memory resource format")
-	}
 	if !ok {
 		klog.V(6).InfoS("unknown", "resource", MemResourceName)
 		return framework.NewStatus(framework.UnschedulableAndUnresolvable, "unknown resource type")
 	}
-
-	klog.V(6).InfoS("calculate", "memory", memCnt, "gpu", gpuCnt)
-	memEachGPU := resource.NewQuantity(memCnt/gpuCnt, resource.DecimalSI)
-	klog.V(6).InfoS("memory each gpu", "memory", memEachGPU.String())
 
 	// calculate assume quantity, return if insufficient
 	var pods []*v1.Pod
@@ -88,8 +78,8 @@ func (f FlexGPU) Filter(ctx context.Context, state *framework.CycleState, pod *v
 		pods = append(pods, po.Pod)
 	}
 
-	gpuCurrLimitSum := podsResourceLimitSum(GPUResourceName, pods)
-	memCurrLimitSum := podsResourceLimitSum(MemResourceName, pods)
+	gpuCurrLimitSum := nodeResourceLimitSum(GPUResourceName, nodeInfo)
+	memCurrLimitSum := nodeResourceLimitSum(MemResourceName, nodeInfo)
 
 	gpuAssumeLimitSum := gpuCurrLimitSum
 	memAssumeLimitSum := memCurrLimitSum
@@ -98,44 +88,36 @@ func (f FlexGPU) Filter(ctx context.Context, state *framework.CycleState, pod *v
 
 	if gpuAssumeLimitSum.Cmp(gpuAllocatable) > 0 {
 		klog.V(6).InfoS("insufficient", "resource", GPUResourceName, "assume", gpuAssumeLimitSum.String(), "allocatable", gpuAllocatable.String())
-		return framework.NewStatus(framework.Unschedulable, "insufficient resource")
+		return framework.NewStatus(framework.Unschedulable, fmt.Sprintf("insufficient resource %v", GPUResourceName))
 	}
 
 	if memAssumeLimitSum.Cmp(memAllocatable) > 0 {
 		klog.V(6).InfoS("insufficient", "resource", MemResourceName, "assume", memAssumeLimitSum.String(), "allocatable", memAllocatable.String())
-		return framework.NewStatus(framework.Unschedulable, "insufficient resource")
+		return framework.NewStatus(framework.Unschedulable, fmt.Sprintf("insufficient resource %v", MemResourceName))
 	}
 
 	// filter out possible fit gpus
-	usage := resourceLimitSumIndexArray(int(gpuCnt), pods)
+	no := NewGPUNode(nodeInfo)
+
 	if klog.V(6).Enabled() {
-		for _, u := range usage {
-			klog.Infoln(u.String())
+		for _, u := range no.gpus {
+			klog.InfoS("node gpu usages", "node", klog.KObj(nodeInfo.Node()), "usage", u.String())
 		}
 	}
 
-	fit := 0
-	for _, u := range usage {
-		if u.monopoly && u.memory.CmpInt64(0) != 0 {
-			klog.Warningf("conflict resource %s and %s on gpu index %d", GPUResourceName, MemResourceName, u.index)
-		}
+	if memLimitExist {
+		indexes := no.MemAssumeFitIndexes(memLimit)
 
-		u.memory.Add(*memLimit)
-		if !u.monopoly && memEachGPU.Cmp(*u.memory) >= 0 {
-			klog.V(6).InfoS("possible fit", "index", u.index)
-			fit++
+		klog.V(6).InfoS("fit indexes", "indexes", indexes)
+		if len(indexes) == 0 {
+			return framework.NewStatus(framework.Unschedulable, fmt.Sprintf("no fit indexes resource %v", MemResourceName))
 		}
-	}
-
-	klog.V(6).InfoS("fit nodes", "count", fit)
-	if fit == 0 {
-		return framework.NewStatus(framework.Unschedulable, "insufficient resource")
 	}
 
 	return nil
 }
 
-func podResourceLimitSum(name v1.ResourceName, pod *v1.Pod) (*resource.Quantity, bool) {
+func podResourceLimit(name v1.ResourceName, pod *v1.Pod) (*resource.Quantity, bool) {
 	exist := false
 	resourceLimitSum := resource.NewQuantity(0, resource.DecimalSI)
 	for _, container := range pod.Spec.Containers {
@@ -147,77 +129,13 @@ func podResourceLimitSum(name v1.ResourceName, pod *v1.Pod) (*resource.Quantity,
 	return resourceLimitSum, exist
 }
 
-func podsResourceLimitSum(name v1.ResourceName, pods []*v1.Pod) *resource.Quantity {
+func nodeResourceLimitSum(name v1.ResourceName, nodeInfo *framework.NodeInfo) *resource.Quantity {
 	resourceLimitSum := resource.NewQuantity(0, resource.DecimalSI)
-	for _, pod := range pods {
-		limit, _ := podResourceLimitSum(name, pod)
+	for _, podInfo := range nodeInfo.Pods {
+		limit, _ := podResourceLimit(name, podInfo.Pod)
 		resourceLimitSum.Add(*limit)
 	}
 	return resourceLimitSum
-}
-
-type gpuUsage struct {
-	index    int
-	monopoly bool
-	memory   *resource.Quantity
-}
-
-func (u *gpuUsage) String() string {
-	return fmt.Sprintf("usage: { index: %v, monopoly: %v, memory: %v}", u.index, u.monopoly, u.memory)
-}
-
-func resourceLimitSumIndexArray(cnt int, pods []*v1.Pod) []*gpuUsage {
-	usage := make([]*gpuUsage, cnt)
-	for i := 0; i < cnt; i++ {
-		usage[i] = &gpuUsage{
-			index:    i,
-			monopoly: false,
-			memory:   resource.NewQuantity(0, resource.DecimalSI),
-		}
-	}
-
-	for _, pod := range pods {
-		gpuLimit, gpuExist := podResourceLimitSum(GPUResourceName, pod)
-		if gpuExist && gpuLimit.CmpInt64(1) != 0 {
-			klog.Warningf("pod %s resource %s limit %s invalid", pod.Name, GPUResourceName, gpuLimit.String())
-		}
-		memLimit, memExist := podResourceLimitSum(MemResourceName, pod)
-
-		if !gpuExist && !memExist {
-			klog.V(6).InfoS("skip", "pod", klog.KObj(pod))
-			continue
-		}
-
-		klog.V(6).InfoS("set monopoly", "pod", klog.KObj(pod))
-		val, hasAnnotation := pod.ObjectMeta.Annotations[GPUIndexAnnotationKey]
-		index, err := strconv.Atoi(val)
-		if err != nil {
-			klog.Warningf("pod %s invalid index annotation %s", pod.Name, val)
-			continue
-		}
-
-		if !hasAnnotation {
-			if !gpuLimit.IsZero() {
-				klog.Warningf("pod %s no index annotation with %s limit set", pod.Name, GPUResourceName)
-			}
-			if !memLimit.IsZero() {
-				klog.Warningf("pod %s no index annotation with %s limit set", pod.Name, MemResourceName)
-			}
-			continue
-		}
-
-		if gpuExist {
-			klog.V(6).InfoS("set monopoly", "pod", klog.KObj(pod))
-			usage[index].monopoly = true
-		}
-
-		if memExist {
-			klog.V(6).InfoS("add memory", "pod", klog.KObj(pod))
-			usage[index].memory.Add(*memLimit)
-		}
-	}
-
-	return usage
 }
 
 func (f FlexGPU) Score(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodeName string) (int64, *framework.Status) {
@@ -233,7 +151,68 @@ func (f FlexGPU) ScoreExtensions() framework.ScoreExtensions {
 	return nil
 }
 
+func (f FlexGPU) Reserve(ctx context.Context, state *framework.CycleState, p *v1.Pod, nodeName string) *framework.Status {
+	nodeInfo, err := f.handle.SnapshotSharedLister().NodeInfos().Get(nodeName)
+	if err != nil {
+		return framework.NewStatus(framework.Error, fmt.Sprintf("getting node %q from Snapshot: %v", nodeName, err))
+	}
+
+	gpuLimit, gpuLimitExist := podResourceLimit(GPUResourceName, p)
+	memLimit, memLimitExist := podResourceLimit(MemResourceName, p)
+
+	if !gpuLimitExist && !memLimitExist {
+		return nil
+	}
+
+	if gpuLimitExist && memLimitExist {
+		return framework.NewStatus(framework.UnschedulableAndUnresolvable, "pod conflict resources")
+	}
+
+	no := NewGPUNode(nodeInfo)
+
+	if gpuLimitExist {
+		indexes := no.GPUAssumeFitIndexes(gpuLimit)
+		if len(indexes) == 0 {
+			return framework.NewStatus(framework.Unschedulable, fmt.Sprintf("allocate index fail %v", GPUResourceName))
+		}
+		if p.Annotations == nil {
+			p.Annotations = make(map[string]string)
+		}
+		p.Annotations[GPUIndexAnnotationKey] = strconv.Itoa(indexes[0])
+	}
+
+	if memLimitExist {
+		indexes := no.MemAssumeFitIndexes(memLimit)
+		if len(indexes) == 0 {
+			return framework.NewStatus(framework.Unschedulable, fmt.Sprintf("allocate index fail %v", MemResourceName))
+		}
+		if p.Annotations == nil {
+			p.Annotations = make(map[string]string)
+		}
+		// indexes is sorted by bin-pack affinity
+		// TODO: maybe provide spread affinity
+		p.Annotations[GPUIndexAnnotationKey] = strconv.Itoa(indexes[0])
+	}
+
+	klog.V(6).InfoS("annotations", "annotations", p.Annotations)
+	return nil
+}
+
+func (f FlexGPU) Unreserve(ctx context.Context, state *framework.CycleState, p *v1.Pod, nodeName string) {
+	klog.V(6).InfoS("unreserve", "annotations", p.Annotations)
+	delete(p.Annotations, GPUIndexAnnotationKey)
+}
+
 func (f FlexGPU) Bind(ctx context.Context, state *framework.CycleState, p *v1.Pod, nodeName string) *framework.Status {
-	//TODO implement me
-	panic("implement me")
+	klog.V(6).InfoS("annotations", "annotations", p.Annotations)
+	klog.V(3).InfoS("Attempting to bind pod to node", "pod", klog.KObj(p), "node", klog.KRef("", nodeName))
+	binding := &v1.Binding{
+		ObjectMeta: metav1.ObjectMeta{Namespace: p.Namespace, Name: p.Name, UID: p.UID, Annotations: p.Annotations},
+		Target:     v1.ObjectReference{Kind: "Node", Name: nodeName},
+	}
+	err := f.handle.ClientSet().CoreV1().Pods(binding.Namespace).Bind(ctx, binding, metav1.CreateOptions{})
+	if err != nil {
+		return framework.AsStatus(err)
+	}
+	return nil
 }

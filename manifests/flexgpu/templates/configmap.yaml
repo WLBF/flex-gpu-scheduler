@@ -18,3 +18,11 @@ data:
           score:
             enabled:
             - name: FlexGPU
+          reserve:
+            enabled:
+            - name: FlexGPU
+          bind:
+            disabled:
+            - name: DefaultBinder
+            enabled:
+            - name: FlexGPU
