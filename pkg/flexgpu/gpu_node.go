@@ -175,3 +175,25 @@ func (n *gpuNode) GPUAssumeFitIndexes(gpuLimit *resource.Quantity) []int {
 	}
 	return fits
 }
+
+func (n *gpuNode) GPUScore() int64 {
+	cnt := 0
+	for _, u := range n.gpus {
+		if !u.monopoly && u.usedMemory.IsZero() {
+			cnt++
+		}
+	}
+	return int64(cnt)
+}
+
+func (n *gpuNode) MemScore() int64 {
+	remainSum := resource.NewQuantity(0, resource.DecimalSI)
+
+	for _, u := range n.gpus {
+		remainSum.Add(*u.memory)
+		remainSum.Sub(*u.usedMemory)
+	}
+
+	rs, _ := remainSum.AsInt64()
+	return rs
+}

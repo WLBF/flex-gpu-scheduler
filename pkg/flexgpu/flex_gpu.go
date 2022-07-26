@@ -9,6 +9,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
+	"math"
 	"strconv"
 )
 
@@ -28,7 +29,7 @@ var _ framework.ScorePlugin = &FlexGPU{}
 var _ framework.BindPlugin = &FlexGPU{}
 var _ framework.ReservePlugin = &FlexGPU{}
 
-func (f FlexGPU) Name() string {
+func (f *FlexGPU) Name() string {
 	return Name
 }
 
@@ -37,7 +38,7 @@ func New(_ runtime.Object, h framework.Handle) (framework.Plugin, error) {
 	return &FlexGPU{handle: h}, nil
 }
 
-func (f FlexGPU) Filter(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
+func (f *FlexGPU) Filter(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
 	if klog.V(6).Enabled() {
 		klog.InfoS("node info", "point", "filter", "name", nodeInfo.Node().Name)
 		klog.InfoS("pod info", "point", "filter", "name", pod.Name)
@@ -138,20 +139,71 @@ func nodeResourceLimitSum(name v1.ResourceName, nodeInfo *framework.NodeInfo) *r
 	return resourceLimitSum
 }
 
-func (f FlexGPU) Score(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodeName string) (int64, *framework.Status) {
-	for _, container := range pod.Spec.Containers {
-		for k, v := range container.Resources.Limits {
-			klog.V(6).InfoS("resource limit", "point", "score", k, v.AsDec().String())
-		}
+func (f *FlexGPU) Score(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodeName string) (int64, *framework.Status) {
+	nodeInfo, err := f.handle.SnapshotSharedLister().NodeInfos().Get(nodeName)
+	if err != nil {
+		return 0, framework.NewStatus(framework.Error, fmt.Sprintf("getting node %q from Snapshot: %v", nodeName, err))
 	}
+
+	no := NewGPUNode(nodeInfo)
+
+	_, gpuLimitExist := podResourceLimit(GPUResourceName, pod)
+	_, memLimitExist := podResourceLimit(MemResourceName, pod)
+
+	if !gpuLimitExist && !memLimitExist {
+		return 0, nil
+	}
+
+	if gpuLimitExist {
+		return no.GPUScore(), nil
+	}
+
+	if memLimitExist {
+		return no.MemScore(), nil
+	}
+
 	return 0, nil
 }
 
-func (f FlexGPU) ScoreExtensions() framework.ScoreExtensions {
+func (f *FlexGPU) ScoreExtensions() framework.ScoreExtensions {
+	return f
+}
+
+func (f *FlexGPU) NormalizeScore(ctx context.Context, state *framework.CycleState, p *v1.Pod, scores framework.NodeScoreList) *framework.Status {
+
+	// Find highest and lowest scores.
+	var highest int64 = -math.MaxInt64
+	var lowest int64 = math.MaxInt64
+	for _, nodeScore := range scores {
+		if nodeScore.Score > highest {
+			highest = nodeScore.Score
+		}
+		if nodeScore.Score < lowest {
+			lowest = nodeScore.Score
+		}
+	}
+
+	// Transform the highest to lowest score range to fit the framework's min to max node score range.
+	oldRange := highest - lowest
+	newRange := framework.MaxNodeScore - framework.MinNodeScore
+	for i, nodeScore := range scores {
+		if oldRange == 0 {
+			scores[i].Score = framework.MinNodeScore
+		} else {
+			scores[i].Score = ((nodeScore.Score - lowest) * newRange / oldRange) + framework.MinNodeScore
+		}
+	}
+
+	// Reverse scores
+	for i, nodeScore := range scores {
+		scores[i].Score = framework.MaxNodeScore - nodeScore.Score
+	}
+
+	klog.V(6).InfoS("normalized scores", "pod", klog.KObj(p), "scores", scores)
 	return nil
 }
 
-func (f FlexGPU) Reserve(ctx context.Context, state *framework.CycleState, p *v1.Pod, nodeName string) *framework.Status {
+func (f *FlexGPU) Reserve(ctx context.Context, state *framework.CycleState, p *v1.Pod, nodeName string) *framework.Status {
 	nodeInfo, err := f.handle.SnapshotSharedLister().NodeInfos().Get(nodeName)
 	if err != nil {
 		return framework.NewStatus(framework.Error, fmt.Sprintf("getting node %q from Snapshot: %v", nodeName, err))
@@ -198,12 +250,12 @@ func (f FlexGPU) Reserve(ctx context.Context, state *framework.CycleState, p *v1
 	return nil
 }
 
-func (f FlexGPU) Unreserve(ctx context.Context, state *framework.CycleState, p *v1.Pod, nodeName string) {
+func (f *FlexGPU) Unreserve(ctx context.Context, state *framework.CycleState, p *v1.Pod, nodeName string) {
 	klog.V(6).InfoS("unreserve", "annotations", p.Annotations)
 	delete(p.Annotations, GPUIndexAnnotationKey)
 }
 
-func (f FlexGPU) Bind(ctx context.Context, state *framework.CycleState, p *v1.Pod, nodeName string) *framework.Status {
+func (f *FlexGPU) Bind(ctx context.Context, state *framework.CycleState, p *v1.Pod, nodeName string) *framework.Status {
 	klog.V(6).InfoS("annotations", "annotations", p.Annotations)
 	klog.V(3).InfoS("Attempting to bind pod to node", "pod", klog.KObj(p), "node", klog.KRef("", nodeName))
 	binding := &v1.Binding{
