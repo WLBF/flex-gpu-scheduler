@@ -9,7 +9,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
-	"math"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/helper"
 	"strconv"
 )
 
@@ -170,35 +170,7 @@ func (f *FlexGPU) ScoreExtensions() framework.ScoreExtensions {
 }
 
 func (f *FlexGPU) NormalizeScore(ctx context.Context, state *framework.CycleState, p *v1.Pod, scores framework.NodeScoreList) *framework.Status {
-
-	// Find highest and lowest scores.
-	var highest int64 = -math.MaxInt64
-	var lowest int64 = math.MaxInt64
-	for _, nodeScore := range scores {
-		if nodeScore.Score > highest {
-			highest = nodeScore.Score
-		}
-		if nodeScore.Score < lowest {
-			lowest = nodeScore.Score
-		}
-	}
-
-	// Transform the highest to lowest score range to fit the framework's min to max node score range.
-	oldRange := highest - lowest
-	newRange := framework.MaxNodeScore - framework.MinNodeScore
-	for i, nodeScore := range scores {
-		if oldRange == 0 {
-			scores[i].Score = framework.MinNodeScore
-		} else {
-			scores[i].Score = ((nodeScore.Score - lowest) * newRange / oldRange) + framework.MinNodeScore
-		}
-	}
-
-	// Reverse scores
-	for i, nodeScore := range scores {
-		scores[i].Score = framework.MaxNodeScore - nodeScore.Score
-	}
-
+	helper.DefaultNormalizeScore(framework.MaxNodeScore, true, scores)
 	klog.V(6).InfoS("normalized scores", "pod", klog.KObj(p), "scores", scores)
 	return nil
 }
