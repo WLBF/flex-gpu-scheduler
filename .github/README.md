@@ -9,8 +9,7 @@ Related project: [WLBF/flex-gpu-device-plugin](https://github.com/WLBF/flex-gpu-
 
 ## Overview
 
-This scheduler plugin enable bin-pack scheduling decisions based on `nvidia.flex.com/gpu` and `nvidia.flex.com/memory` resource. 
-Allow pods exclusive or share usage of nvidia gpus. Scheduled pod will be marked with `nividia.flex.com/index` annotation to denote its gpu index in running node.
+This scheduler plugin enable bin-pack scheduling decisions based on `nvidia.flex.com/gpu` and `nvidia.flex.com/memory` resource. Allow pods exclusive or share usage of nvidia gpus. Scheduled pod will be marked with `nividia.flex.com/index` annotation to denote its gpu index in running node.
 
 ## Install
 
